@@ -1,6 +1,6 @@
 {
   "name": "weixin-claude-code",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "微信 Channel for Claude Code — 通过 iLink Bot API 实现微信与 Claude Code 的双向消息通信",
   "mcpServers": "./mcp-servers.json"
 }
