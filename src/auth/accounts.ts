@@ -2,6 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { getSyncBufFilePath } from "../storage/sync-buf.js";
+
 
 export const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 export const CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
@@ -51,6 +53,7 @@ export function registerWeixinAccountId(accountId: string): void {
   const updated = [...existing, accountId];
   fs.writeFileSync(resolveAccountIndexPath(), JSON.stringify(updated, null, 2), "utf-8");
 }
+
 
 // ---------------------------------------------------------------------------
 // Account store (per-account credential files)
@@ -128,13 +131,18 @@ export function saveWeixinAccount(
   }
 }
 
-/** Remove account data file. */
-export function clearWeixinAccount(accountId: string): void {
-  try {
-    fs.unlinkSync(resolveAccountPath(accountId));
-  } catch {
-    // ignore if not found
-  }
+/** Remove account: delete credential file, sync buf, and remove from index. */
+export function removeWeixinAccount(accountId: string): void {
+  // 删除凭证文件
+  try { fs.unlinkSync(resolveAccountPath(accountId)); } catch { /* ignore */ }
+  // 删除 sync buf 文件
+  try { fs.unlinkSync(getSyncBufFilePath(accountId)); } catch { /* ignore */ }
+  // 从索引中移除
+  const existing = listIndexedWeixinAccountIds();
+  const updated = existing.filter((id) => id !== accountId);
+  const dir = resolveWeixinStateDir();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(resolveAccountIndexPath(), JSON.stringify(updated, null, 2), "utf-8");
 }
 
 // ---------------------------------------------------------------------------

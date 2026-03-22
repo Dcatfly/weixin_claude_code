@@ -26,8 +26,8 @@ export declare function saveWeixinAccount(accountId: string, update: {
     baseUrl?: string;
     userId?: string;
 }): void;
-/** Remove account data file. */
-export declare function clearWeixinAccount(accountId: string): void;
+/** Remove account: delete credential file, sync buf, and remove from index. */
+export declare function removeWeixinAccount(accountId: string): void;
 export type ResolvedWeixinAccount = {
     accountId: string;
     baseUrl: string;

@@ -7,7 +7,7 @@ import {
 import { getContextToken } from "./messaging/inbound.js";
 import { markdownToPlainText, sendMessageWeixin } from "./messaging/send.js";
 import { sendWeixinMediaFile } from "./messaging/send-media.js";
-import { resolveWeixinAccount, listIndexedWeixinAccountIds } from "./auth/accounts.js";
+import { resolveWeixinAccount, listIndexedWeixinAccountIds, removeWeixinAccount } from "./auth/accounts.js";
 import { startWeixinLoginWithQr, waitForWeixinLogin, DEFAULT_ILINK_BOT_TYPE } from "./auth/login-qr.js";
 import { saveWeixinAccount, registerWeixinAccountId, normalizeAccountId } from "./auth/accounts.js";
 import { resetSession, isSessionPaused } from "./api/session-guard.js";
@@ -65,6 +65,10 @@ export function setPollLoopRunning(running: boolean): void { pollLoopRunning = r
 let onLoginSuccess: ((accountId: string) => void) | undefined;
 export function setOnLoginSuccess(cb: (accountId: string) => void): void { onLoginSuccess = cb; }
 
+// poll-loop abort 控制（供 logout 停止 poll-loop）
+let pollAbortController: AbortController | undefined;
+export function setPollAbortController(ac: AbortController): void { pollAbortController = ac; }
+
 // 模块级 server 引用，供 handleLogin 发 notification
 let mcpServer: Server | undefined;
 
@@ -106,6 +110,11 @@ export function createMcpServer(): Server {
         description: "查询当前微信连接状态",
         inputSchema: { type: "object" as const, properties: {} },
       },
+      {
+        name: "logout",
+        description: "登出微信，清除凭证并停止消息接收",
+        inputSchema: { type: "object" as const, properties: {} },
+      },
     ],
   }));
 
@@ -121,6 +130,9 @@ export function createMcpServer(): Server {
     }
     if (name === "status") {
       return handleStatus();
+    }
+    if (name === "logout") {
+      return handleLogout();
     }
     throw new Error(`unknown tool: ${name}`);
   });
@@ -265,6 +277,40 @@ async function handleStatus() {
         lastInboundAt,
         sessionPaused: paused,
       }),
+    }],
+  };
+}
+
+async function handleLogout() {
+  const accountIds = listIndexedWeixinAccountIds();
+  if (accountIds.length === 0) {
+    return { content: [{ type: "text" as const, text: "当前没有已登录的微信账号" }] };
+  }
+
+  const accountId = accountIds[0];
+  const account = resolveWeixinAccount(accountId);
+
+  // 停止 poll-loop
+  if (pollAbortController) {
+    pollAbortController.abort();
+    pollAbortController = undefined;
+  }
+
+  // 用 userId (chatId) 停止 typing，不是 accountId
+  if (account.userId) {
+    stopTyping(account.userId);
+  }
+  setPollLoopRunning(false);
+
+  // 清除凭证和索引
+  removeWeixinAccount(accountId);
+
+  logger.info(`logout: account ${accountId} cleared`);
+
+  return {
+    content: [{
+      type: "text" as const,
+      text: `已登出微信账号 ${accountId}，凭证已清除。如需重新连接请调用 login 工具。`,
     }],
   };
 }

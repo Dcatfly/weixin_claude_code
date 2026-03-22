@@ -4,7 +4,8 @@
       "Bash(pnpm install:*)",
       "Bash(pnpm add:*)",
       "mcp__wechat__login",
-      "mcp__wechat__reply"
+      "mcp__wechat__reply",
+      "mcp__wechat__logout"
     ]
   },
   "enableAllProjectMcpServers": true,

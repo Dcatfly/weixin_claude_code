@@ -1,5 +1,5 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { createMcpServer, setOnLoginSuccess, setPollLoopRunning } from "./mcp-server.js";
+import { createMcpServer, setOnLoginSuccess, setPollLoopRunning, setPollAbortController } from "./mcp-server.js";
 import { startPollLoop } from "./poll-loop.js";
 import { listIndexedWeixinAccountIds, resolveWeixinAccount } from "./auth/accounts.js";
 import { logger } from "./util/logger.js";
@@ -13,17 +13,22 @@ async function main() {
     await server.connect(transport);
     logger.info("MCP server connected via stdio");
     const abortController = new AbortController();
-    // 启动 poll-loop 的函数
+    // 启动 poll-loop 的函数，返回是否成功启动
     function launchPollLoop(accountId) {
         const account = resolveWeixinAccount(accountId);
         if (!account.configured) {
             logger.warn(`account ${accountId} not configured, skipping poll-loop`);
-            return;
+            return false;
         }
         if (!account.userId) {
             logger.warn(`account ${accountId} has no userId, skipping poll-loop`);
-            return;
+            return false;
         }
+        // pollAbort: logout 时停止当前 poll-loop
+        // AbortSignal.any: 全局退出 (SIGINT/SIGTERM) 或 logout 都能停止
+        const pollAbort = new AbortController();
+        setPollAbortController(pollAbort);
+        const combinedSignal = AbortSignal.any([abortController.signal, pollAbort.signal]);
         startPollLoop({
             server,
             baseUrl: account.baseUrl,
@@ -31,13 +36,14 @@ async function main() {
             token: account.token,
             accountId: account.accountId,
             allowedUserId: account.userId,
-            abortSignal: abortController.signal,
+            abortSignal: combinedSignal,
         }).catch((err) => {
-            if (!abortController.signal.aborted) {
+            if (!combinedSignal.aborted) {
                 logger.error(`poll-loop crashed: ${String(err)}`);
                 setPollLoopRunning(false);
             }
         });
+        return true;
     }
     // 登录成功后的回调
     setOnLoginSuccess((accountId) => {
@@ -46,11 +52,8 @@ async function main() {
     });
     // 检查已有凭证
     const accountIds = listIndexedWeixinAccountIds();
-    if (accountIds.length > 0) {
-        logger.info(`found existing account: ${accountIds[0]}, launching poll-loop`);
-        launchPollLoop(accountIds[0]);
-    }
-    else {
+    const launched = accountIds.length > 0 && launchPollLoop(accountIds[0]);
+    if (!launched) {
         logger.info("no accounts found, sending login prompt notification");
         // 延迟发送，确保 MCP 连接就绪
         setTimeout(async () => {
