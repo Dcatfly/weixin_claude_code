@@ -31,7 +31,9 @@ weixin_claw/
 │   │   └── login-qr.ts       # 扫码登录流程
 │   ├── api/
 │   │   ├── api.ts            # HTTP 通信层 (iLink Bot API)
-│   │   └── types.ts          # 协议类型定义
+│   │   ├── types.ts          # 协议类型定义
+│   │   ├── config-cache.ts   # typing_ticket 缓存管理
+│   │   └── session-guard.ts  # 会话过期检测与暂停
 │   ├── cdn/
 │   │   ├── aes-ecb.ts        # AES-128-ECB 加解密
 │   │   ├── cdn-upload.ts     # CDN 上传逻辑
@@ -44,8 +46,10 @@ weixin_claw/
 │   │   └── silk-transcode.ts # 语音转码 (silk -> wav)
 │   ├── messaging/
 │   │   ├── inbound.ts        # 入站消息标准化
-│   │   ├── send.ts           # 发送文本消息
-│   │   └── send-media.ts     # 发送媒体消息
+│   │   ├── send.ts           # 消息构建与发送（文本+媒体）
+│   │   └── send-media.ts     # 媒体上传+发送编排
+│   ├── storage/
+│   │   └── sync-buf.ts       # getUpdates 断点持久化
 │   └── util/
 │       ├── logger.ts         # 日志
 │       ├── random.ts         # ID 生成
@@ -62,11 +66,14 @@ weixin_claw/
 - **直接复用**（改动极小）：`api/types.ts`、`cdn/*`、`messaging/send-media.ts`、`media/mime.ts`、`media/silk-transcode.ts`、`util/random.ts`、`util/redact.ts`
 - **适配修改**（去除 `openclaw/plugin-sdk` 依赖，更改存储路径等）：
   - `api/api.ts` — 移除 `loadConfigRouteTag` 调用，SKRouteTag header 改为可选参数传入
-  - `auth/accounts.ts` — 替换 `normalizeAccountId`（原逻辑：将 `@` 和 `.` 替换为 `-`），存储路径改为 `~/.claude/channels/wechat/`
-  - `auth/login-qr.ts` — 移除 `loadConfigRouteTag` 依赖
+  - `api/config-cache.ts` — 移除 SDK 类型依赖，typing_ticket 缓存 TTL 改为随机刷新（最长 24 小时内刷新），失败时指数退避（初始 2 秒，最大 1 小时），与 vendor 行为一致
+  - `api/session-guard.ts` — 保留 errcode -14 检测逻辑；设计变更：vendor 原实现为暂停 1 小时后自动重试，此处改为暂停 poll 并通知用户手动 `login` 重新扫码，因为 MCP Channel 场景下 token 过期通常需要重新认证
+  - `auth/accounts.ts` — 自行实现 `normalizeAccountId`（将 `@` 和 `.` 替换为 `-`，已通过 vendor 代码 `deriveRawAccountId` 反向确认），存储路径改为 `~/.claude/channels/wechat/`，去除 `deriveRawAccountId` 和 `loadLegacyToken` 等向后兼容逻辑
+  - `auth/login-qr.ts` — 移除 `loadConfigRouteTag` 依赖；`qrcode-terminal` 输出重定向到 stderr（stdout 是 MCP 协议通道），或作为备用方案仅依赖 `qrcodeUrl` 返回值让 Claude 展示
   - `media/media-download.ts` — 将 `saveMediaBuffer` 回调替换为本地文件写入（`os.tmpdir()/weixin-claw/media/inbound/`）
   - `messaging/inbound.ts` — 简化，去掉 `MsgContext` 类型，保留消息解析和 `context_token` 缓存
-  - `messaging/send.ts` — 自行实现 `markdownToPlainText`（替代 `openclaw/plugin-sdk` 的 `stripMarkdown`），移除 `ReplyPayload` 类型依赖
+  - `messaging/send.ts` — 自行实现完整的 `markdownToPlainText`：vendor 版本先处理代码围栏/图片/链接/表格，最后调用 SDK 的 `stripMarkdown(result)` 做最终清理（去除 `**`、`*`、`~~`、`#` 等 Markdown 格式标记），新实现需将此逻辑内联，不依赖 SDK；移除 `ReplyPayload` 类型依赖
+  - `storage/sync-buf.ts` — 从 vendor 的 `storage/sync-buf.ts` 适配，去除 legacy 兼容路径回退，存储路径改为 `~/.claude/channels/wechat/sync/`
   - `util/logger.ts` — 重写为 stderr 输出（stdout 是 MCP 协议通道）
 - **全新编写**：`index.ts`、`mcp-server.ts`、`poll-loop.ts`
 
@@ -166,7 +173,7 @@ weixin_claw/
 
 收到微信消息后，自动发送 typing 状态让微信端显示"对方正在输入..."：
 
-1. 收到消息时，通过 `ilink/bot/getconfig` 获取该用户的 `typing_ticket`（带内存缓存，TTL 5 分钟，失败时指数退避）
+1. 收到消息时，通过 `ilink/bot/getconfig` 获取该用户的 `typing_ticket`（带内存缓存，随机 TTL 最长 24 小时内刷新，失败时指数退避：初始 2 秒，最大 1 小时）
 2. 发送 notification 给 Claude 前，调用 `ilink/bot/sendtyping`（status=1 表示开始输入）
 3. 每 5 秒发送一次 keepalive（微信端的 typing 状态约 8 秒后自动消失）
 4. Claude 调用 `reply` 工具时，自动取消 typing（status=2）
@@ -199,7 +206,7 @@ weixin_claw/
 |------|----------|
 | long-poll 超时 | 正常行为，立即重试 |
 | 连续 3 次 API 失败 | 退避 30 秒后重试 |
-| session 过期 (errcode -14) | 暂停 poll，通知用户重新登录 |
+| session 过期 (errcode -14) | 暂停 poll，通知用户调用 `login` 重新扫码（设计变更：vendor 原为暂停 1 小时后自动重试） |
 | 媒体下载/上传失败 | 通知 Claude 失败原因，文本消息正常送达 |
 | MCP 连接断开 | 进程退出，由 Claude Code 重新拉起 |
 
