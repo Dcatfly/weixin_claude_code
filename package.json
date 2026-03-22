@@ -1,0 +1,28 @@
+{
+  "name": "weixin-claude-code-channel",
+  "version": "0.1.0",
+  "description": "WeChat Channel for Claude Code via iLink Bot API",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test dist/**/*.test.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "qrcode-terminal": "0.12.0",
+    "silk-wasm": "^3.7.1",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "typescript": "^5.9.3"
+  }
+}
