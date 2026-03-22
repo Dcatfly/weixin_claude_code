@@ -1,6 +1,6 @@
 {
   "wechat": {
-    "command": "node",
-    "args": ["${CLAUDE_PLUGIN_ROOT}/dist/index.js"]
+    "command": "npm",
+    "args": ["run", "--prefix", "${CLAUDE_PLUGIN_ROOT}", "--silent", "start"]
   }
 }
