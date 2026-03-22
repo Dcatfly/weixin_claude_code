@@ -59,8 +59,15 @@ weixin_claw/
 
 从 `vendor/package/src/` 复制源文件到 `src/`，然后做适配修改：
 
-- **直接复用**（改动极小）：`api/api.ts`、`api/types.ts`、`cdn/*`、`messaging/send.ts`、`messaging/send-media.ts`、`media/mime.ts`、`media/silk-transcode.ts`、`util/*`
-- **适配修改**（去除 `openclaw/plugin-sdk` 依赖，更改存储路径）：`auth/accounts.ts`、`auth/login-qr.ts`、`media/media-download.ts`、`messaging/inbound.ts`
+- **直接复用**（改动极小）：`api/types.ts`、`cdn/*`、`messaging/send-media.ts`、`media/mime.ts`、`media/silk-transcode.ts`、`util/random.ts`、`util/redact.ts`
+- **适配修改**（去除 `openclaw/plugin-sdk` 依赖，更改存储路径等）：
+  - `api/api.ts` — 移除 `loadConfigRouteTag` 调用，SKRouteTag header 改为可选参数传入
+  - `auth/accounts.ts` — 替换 `normalizeAccountId`（原逻辑：将 `@` 和 `.` 替换为 `-`），存储路径改为 `~/.claude/channels/wechat/`
+  - `auth/login-qr.ts` — 移除 `loadConfigRouteTag` 依赖
+  - `media/media-download.ts` — 将 `saveMediaBuffer` 回调替换为本地文件写入（`os.tmpdir()/weixin-claw/media/inbound/`）
+  - `messaging/inbound.ts` — 简化，去掉 `MsgContext` 类型，保留消息解析和 `context_token` 缓存
+  - `messaging/send.ts` — 自行实现 `markdownToPlainText`（替代 `openclaw/plugin-sdk` 的 `stripMarkdown`），移除 `ReplyPayload` 类型依赖
+  - `util/logger.ts` — 重写为 stderr 输出（stdout 是 MCP 协议通道）
 - **全新编写**：`index.ts`、`mcp-server.ts`、`poll-loop.ts`
 
 ## 数据流
@@ -68,27 +75,30 @@ weixin_claw/
 ### 入站（微信 → Claude）
 
 1. `poll-loop` 调用 `ilink/bot/getupdates`（HTTP long-poll，35 秒超时）
-2. 过滤消息：仅接受 `msg.from_user_id === savedUserId`（登录用户）
-3. 如果消息包含媒体（图片/语音/视频/文件），从微信 CDN 下载到本地临时目录并解密
-4. 发送 MCP notification：
+2. 过滤消息：仅接受 `msg.from_user_id === savedUserId`（登录用户自己的微信 ID，扫码时由 iLink API 返回的 `ilink_user_id`）
+3. 如果消息包含媒体（图片/语音/视频/文件），从微信 CDN 下载到本地临时目录（`os.tmpdir()/weixin-claw/media/inbound/`）并解密
+4. 自动发送 typing 状态（通过 `ilink/bot/sendtyping`，需要 `typing_ticket`）
+5. 发送 MCP notification：
    ```
    method: 'notifications/claude/channel'
    params:
-     content: <文本内容>
+     content: <文本内容>（引用消息格式化为 "[引用: ...]\n{text}"）
      meta:
        chat_id: <from_user_id>
        sender: <from_user_id>
        media_path: <本地文件路径，如有媒体>
        media_type: <MIME 类型，如有媒体>
    ```
-5. 缓存消息中的 `context_token`（以 chat_id 为键），用于出站回复
+6. 缓存消息中的 `context_token`（内存 Map，以 chat_id 为键，后到的覆盖先到的，不持久化）
 
 ### 出站（Claude → 微信）
 
 1. Claude 调用 `reply` 工具，传入 `chat_id`、`text`，可选 `media_path`
-2. 查找缓存的 `context_token`
-3. 纯文本：直接调用 `ilink/bot/sendmessage`
-4. 带媒体：AES-128-ECB 加密文件 → 从 `ilink/bot/getuploadurl` 获取预签名上传地址 → 上传到微信 CDN → 发送引用 CDN 资源的消息
+2. 查找缓存的 `context_token`（如未找到则报错 "未收到过该用户的消息，无法回复"）
+3. 对 `text` 执行 Markdown → 纯文本转换（剥离代码围栏、图片语法、链接语法、表格分隔行等，微信不支持 Markdown 渲染）
+4. 取消 typing 状态
+5. 纯文本：直接调用 `ilink/bot/sendmessage`
+6. 带媒体：AES-128-ECB 加密文件 → 从 `ilink/bot/getuploadurl` 获取预签名上传地址 → 上传到微信 CDN → 发送引用 CDN 资源的消息
 
 ## MCP 工具
 
@@ -115,6 +125,9 @@ weixin_claw/
   name: 'login',
   inputSchema: { properties: {} },
 }
+// 返回值：{ qrcodeUrl: string, message: string }
+// qrcodeUrl 为二维码图片链接，Claude 可展示给用户
+// 工具内部同时启动后台轮询扫码状态，确认后自动保存凭证并启动 long-poll
 ```
 
 ### `status` — 查询连接状态
@@ -124,6 +137,7 @@ weixin_claw/
   name: 'status',
   inputSchema: { properties: {} },
 }
+// 返回值：{ connected: boolean, accountId?: string, userId?: string, lastInboundAt?: number }
 ```
 
 ### Instructions（系统指令）
@@ -148,16 +162,28 @@ weixin_claw/
 - 暂停 long-poll，发 notification 通知用户连接已断开
 - 用户调用 `login` 工具重新认证
 
+## Typing 状态指示
+
+收到微信消息后，自动发送 typing 状态让微信端显示"对方正在输入..."：
+
+1. 收到消息时，通过 `ilink/bot/getconfig` 获取该用户的 `typing_ticket`（带内存缓存，TTL 5 分钟，失败时指数退避）
+2. 发送 notification 给 Claude 前，调用 `ilink/bot/sendtyping`（status=1 表示开始输入）
+3. 每 5 秒发送一次 keepalive（微信端的 typing 状态约 8 秒后自动消失）
+4. Claude 调用 `reply` 工具时，自动取消 typing（status=2）
+5. 如果获取 `typing_ticket` 失败，静默跳过 typing（不影响消息收发）
+
 ## 存储结构
 
 ```
 ~/.claude/channels/wechat/
-├── accounts.json           # 账号 ID 列表
+├── accounts.json                # 账号 ID 列表
 ├── accounts/
-│   └── <accountId>.json    # { token, baseUrl, userId, savedAt }
+│   └── <accountId>.json         # { token, baseUrl, userId, savedAt }
 └── sync/
-    └── <accountId>.buf     # getUpdates 的 get_updates_buf 断点
+    └── <accountId>.sync.json    # { get_updates_buf: "<base64 string>" }
 ```
+
+说明：`cdnBaseUrl` 使用硬编码常量 `https://novac2c.cdn.weixin.qq.com/c2c`（与原插件一致），不存储在账号文件中。
 
 ## 安全门控
 
@@ -177,23 +203,52 @@ weixin_claw/
 | 媒体下载/上传失败 | 通知 Claude 失败原因，文本消息正常送达 |
 | MCP 连接断开 | 进程退出，由 Claude Code 重新拉起 |
 
+## 临时文件管理
+
+入站媒体下载到 `os.tmpdir()/weixin-claw/media/inbound/`，出站媒体临时文件存放在 `os.tmpdir()/weixin-claw/media/outbound/`。进程启动时清理超过 24 小时的临时文件。
+
 ## 依赖
 
 - `@modelcontextprotocol/sdk` — MCP 服务器实现
 - `qrcode-terminal` — 终端二维码显示
 - `zod` — Schema 校验
+- `silk-wasm` — SILK 语音格式转码为 WAV
 - `typescript`（dev）— 类型检查与编译
 
 运行时要求：Node.js >= 22（原生 fetch）。
 
 ## iLink Bot API 端点
 
-| 端点 | 用途 |
-|------|------|
-| `ilink/bot/get_bot_qrcode` | 获取登录二维码 |
-| `ilink/bot/get_qrcode_status` | 轮询扫码状态 |
-| `ilink/bot/getupdates` | Long-poll 接收入站消息 |
-| `ilink/bot/sendmessage` | 发送消息 |
-| `ilink/bot/sendtyping` | 发送输入状态指示 |
-| `ilink/bot/getconfig` | 获取 bot 配置 |
-| `ilink/bot/getuploadurl` | 获取 CDN 预签名上传地址 |
+| 端点 | 方法 | 用途 |
+|------|------|------|
+| `ilink/bot/get_bot_qrcode` | GET | 获取登录二维码 |
+| `ilink/bot/get_qrcode_status` | GET | 轮询扫码状态 |
+| `ilink/bot/getupdates` | POST | Long-poll 接收入站消息 |
+| `ilink/bot/sendmessage` | POST | 发送消息 |
+| `ilink/bot/sendtyping` | POST | 发送输入状态指示 |
+| `ilink/bot/getconfig` | POST | 获取 bot 配置（含 typing_ticket） |
+| `ilink/bot/getuploadurl` | POST | 获取 CDN 预签名上传地址 |
+
+## 全新编写模块说明
+
+### `index.ts`
+
+启动顺序：
+1. 创建 MCP Server 实例（声明 `claude/channel` + `tools` capabilities）
+2. 通过 stdio 连接 Claude Code
+3. 检查已保存凭证 → 有则启动 `poll-loop`，无则发 notification 提示登录
+4. MCP Server 和 poll-loop 并行运行
+
+### `mcp-server.ts`
+
+- 创建 MCP Server，capabilities 声明 `{ experimental: { 'claude/channel': {} }, tools: {} }`
+- 注册 `reply`、`login`、`status` 三个工具的 handler
+- 提供 `sendNotification` 方法供 `poll-loop` 调用
+- 管理 typing 状态的启停
+
+### `poll-loop.ts`
+
+基于原始 `monitor.ts` 简化：
+- 保留 long-poll 循环、错误退避、session 过期检测
+- 去掉 OpenClaw 的 `processOneMessage`、agent 路由、回复调度、斜杠命令
+- 替换为：过滤 → 下载媒体 → 启动 typing → 发送 MCP notification
