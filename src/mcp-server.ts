@@ -65,6 +65,9 @@ export function setPollLoopRunning(running: boolean): void { pollLoopRunning = r
 let onLoginSuccess: ((accountId: string) => void) | undefined;
 export function setOnLoginSuccess(cb: (accountId: string) => void): void { onLoginSuccess = cb; }
 
+// 模块级 server 引用，供 handleLogin 发 notification
+let mcpServer: Server | undefined;
+
 export function createMcpServer(): Server {
   const server = new Server(
     { name: "wechat", version: "0.1.0" },
@@ -122,6 +125,7 @@ export function createMcpServer(): Server {
     throw new Error(`unknown tool: ${name}`);
   });
 
+  mcpServer = server;
   return server;
 }
 
@@ -189,17 +193,27 @@ async function handleLogin() {
     return { content: [{ type: "text" as const, text: `登录失败: ${startResult.message}` }] };
   }
 
-  // 生成 ASCII 二维码，包含在工具响应中让用户直接看到
-  let qrAscii = "";
-  try {
-    const qrcodeterminal = await import("qrcode-terminal");
-    qrAscii = await new Promise<string>((resolve) => {
-      qrcodeterminal.default.generate(startResult.qrcodeUrl!, { small: true }, (qr: string) => {
-        resolve(qr);
+  // 通过 channel notification 发送 ASCII 二维码（避免工具响应被折叠）
+  if (mcpServer) {
+    try {
+      const qrcodeterminal = await import("qrcode-terminal");
+      const qrAscii = await new Promise<string>((resolve) => {
+        qrcodeterminal.default.generate(startResult.qrcodeUrl!, { small: true }, (qr: string) => {
+          resolve(qr);
+        });
       });
-    });
-  } catch {
-    // qrcode-terminal 不可用，回退到仅显示 URL
+      if (qrAscii) {
+        await mcpServer.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: `请用微信扫描以下二维码登录:\n\n${qrAscii}\n链接: ${startResult.qrcodeUrl}`,
+            meta: { type: "qrcode" },
+          },
+        });
+      }
+    } catch {
+      // qrcode-terminal 不可用，回退到仅在工具响应中显示 URL
+    }
   }
 
   // 后台轮询扫码状态
@@ -226,14 +240,10 @@ async function handleLogin() {
     }
   })().catch((err) => logger.error(`background login poll failed: ${String(err)}`));
 
-  const responseText = qrAscii
-    ? `请用微信扫描以下二维码登录:\n\n${qrAscii}\n链接: ${startResult.qrcodeUrl}\n\n${startResult.message}`
-    : `请用微信扫描二维码登录:\n${startResult.qrcodeUrl}\n\n${startResult.message}`;
-
   return {
     content: [{
       type: "text" as const,
-      text: responseText,
+      text: `${startResult.message}\n\n链接: ${startResult.qrcodeUrl}`,
     }],
   };
 }
