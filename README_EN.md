@@ -2,7 +2,7 @@
 
 WeChat Channel plugin for Claude Code — bidirectional messaging between WeChat and Claude Code.
 
-Ported from the communication layer of [`@tencent-weixin/openclaw-weixin`](https://www.npmjs.com/package/@tencent-weixin/openclaw-weixin) v1.0.2, adapted for Claude Code's [Channel](https://docs.anthropic.com/en/docs/claude-code/channels) feature.
+Built on [`weixin-bot-plugin`](https://github.com/Dcatfly/weixin_bot_plugin) WeChat SDK, adapted for Claude Code's [Channel](https://docs.anthropic.com/en/docs/claude-code/channels) feature.
 
 [中文文档](./README.md)
 
@@ -78,7 +78,7 @@ Call the `logout` tool in Claude Code to disconnect and clear all local credenti
 WeChat User <-> WeChat Server <-> iLink Bot API <-> [Plugin MCP Server] <-> Claude Code
 ```
 
-The plugin runs as an MCP Channel server, receiving WeChat messages via iLink Bot API long-polling and pushing them to the Claude Code session as Channel notifications. Claude replies through the `reply` tool, which sends messages back to WeChat.
+The plugin runs as an MCP Channel server. WeChat communication is handled by the [`weixin-bot-plugin`](https://github.com/Dcatfly/weixin_bot_plugin) library (iLink Bot API long-polling, CDN media encryption, SILK voice transcoding, etc.). The plugin pushes received messages to the Claude Code session as Channel notifications. Claude replies through the `reply` tool, which sends messages back to WeChat.
 
 ## Limitations
 

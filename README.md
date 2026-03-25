@@ -2,7 +2,7 @@
 
 微信 Channel 插件 for Claude Code —— 通过微信与 Claude Code 双向通信。
 
-基于 [`@tencent-weixin/openclaw-weixin`](https://www.npmjs.com/package/@tencent-weixin/openclaw-weixin) v1.0.2 的通信层移植，适配 Claude Code 的 [Channel](https://docs.anthropic.com/en/docs/claude-code/channels) 功能实现。
+基于 [`weixin-bot-plugin`](https://github.com/Dcatfly/weixin_bot_plugin) 微信通信库，适配 Claude Code 的 [Channel](https://docs.anthropic.com/en/docs/claude-code/channels) 功能实现。
 
 [English](./README_EN.md)
 
@@ -78,7 +78,7 @@ claude --dangerously-load-development-channels plugin:weixin-claude-code@dcatfly
 微信用户 <-> 微信服务器 <-> iLink Bot API <-> [本插件 MCP Server] <-> Claude Code
 ```
 
-插件作为 MCP Channel 服务器运行，通过 iLink Bot API 的 long-poll 机制接收微信消息，然后以 Channel notification 的形式推送到 Claude Code 会话中。Claude 通过 reply 工具将回复发回微信。
+插件作为 MCP Channel 服务器运行。微信通信由 [`weixin-bot-plugin`](https://github.com/Dcatfly/weixin_bot_plugin) 库处理（iLink Bot API long-poll 收消息、CDN 媒体加解密、SILK 语音转码等），本插件将收到的消息以 Channel notification 推送到 Claude Code 会话中。Claude 通过 reply 工具将回复发回微信。
 
 ## 局限性
 
