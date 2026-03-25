@@ -1,36 +1,44 @@
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import os from "node:os";
+import path from "node:path";
 
-import { createMcpServer, setOnLoginSuccess, setPollLoopRunning, setPollAbortController } from "./mcp-server.js";
-import { startPollLoop } from "./poll-loop.js";
-import { listIndexedWeixinAccountIds, resolveWeixinAccount } from "./auth/accounts.js";
-import { logger } from "./util/logger.js";
-import { cleanupTempMedia } from "./media/media-download.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { WeixinBotClient } from "weixin-bot-plugin";
+import type { InboundMessage } from "weixin-bot-plugin";
+
+import { createMcpServer, PERMISSION_REPLY_RE, getPendingPermissionRequestId, clearPendingPermissionRequestId } from "./mcp-server.js";
+
+function log(msg: string): void {
+  process.stderr.write(`[weixin-claw] ${msg}\n`);
+}
 
 async function main() {
-  logger.info("weixin-claude-code channel starting...");
+  log("weixin-claude-code channel starting...");
+
+  const client = new WeixinBotClient({
+    stateDir: path.join(os.homedir(), ".claude", "channels", "wechat"),
+    tempDir: path.join(os.tmpdir(), "weixin-claude-code"),
+    clientIdPrefix: "openclaw-weixin",
+  });
 
   // 清理过期临时文件
-  await cleanupTempMedia().catch((err: unknown) =>
-    logger.warn(`temp cleanup failed: ${String(err)}`),
+  await client.cleanupTempMedia().catch((err: unknown) =>
+    log(`temp cleanup failed: ${String(err)}`),
   );
 
-  const server = createMcpServer();
+  const server = createMcpServer(client);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  log("MCP server connected via stdio");
 
-  logger.info("MCP server connected via stdio");
-
-  const abortController = new AbortController();
+  // shutdown
   let shuttingDown = false;
-
   function shutdown(): void {
     if (shuttingDown) return;
     shuttingDown = true;
-    logger.info("shutting down...");
-    abortController.abort();
+    log("shutting down...");
+    client.stop();
     process.exit(0);
   }
-
   process.stdin.on("end", shutdown);
   process.stdin.on("close", shutdown);
   process.on("SIGINT", shutdown);
@@ -52,50 +60,80 @@ async function main() {
   // 只能无条件启动 poll-loop，建议只在需要的会话中启动此 MCP Server。
   // ---------------------------------------------------------------------------
 
-  // 启动 poll-loop 的函数，返回是否成功启动
-  function launchPollLoop(accountId: string): boolean {
-    const account = resolveWeixinAccount(accountId);
-    if (!account.configured) {
-      logger.warn(`account ${accountId} not configured, skipping poll-loop`);
-      return false;
-    }
-    if (!account.userId) {
-      logger.warn(`account ${accountId} has no userId, skipping poll-loop`);
-      return false;
-    }
-    // pollAbort: logout 时停止当前 poll-loop
-    // AbortSignal.any: 全局退出 (SIGINT/SIGTERM) 或 logout 都能停止
-    const pollAbort = new AbortController();
-    setPollAbortController(pollAbort);
-    const combinedSignal = AbortSignal.any([abortController.signal, pollAbort.signal]);
-    startPollLoop({
-      server,
-      baseUrl: account.baseUrl,
-      cdnBaseUrl: account.cdnBaseUrl,
-      token: account.token,
-      accountId: account.accountId,
-      allowedUserId: account.userId,
-      abortSignal: combinedSignal,
-    }).catch((err) => {
-      if (!combinedSignal.aborted) {
-        logger.error(`poll-loop crashed: ${String(err)}`);
-        setPollLoopRunning(false);
+  // 绑定事件
+  client.on("message", async (msg: InboundMessage) => {
+    // 权限回复拦截
+    const permMatch = PERMISSION_REPLY_RE.exec(msg.text);
+    if (permMatch) {
+      const requestId = permMatch[2]?.toLowerCase() ?? getPendingPermissionRequestId();
+      if (requestId) {
+        await server.notification({
+          method: "notifications/claude/channel/permission" as any,
+          params: {
+            request_id: requestId,
+            behavior: permMatch[1].toLowerCase().startsWith("y") ? "allow" : "deny",
+          },
+        });
+        clearPendingPermissionRequestId();
+        return;
       }
-    });
-    return true;
-  }
+    }
 
-  // 登录成功后的回调
-  setOnLoginSuccess((accountId) => {
-    logger.info(`login success callback, launching poll-loop for ${accountId}`);
-    launchPollLoop(accountId);
+    // 正常消息 → typing + MCP notification
+    client.startTyping(msg.chatId);
+
+    const meta: Record<string, string> = {
+      chat_id: msg.chatId,
+      sender: msg.chatId,
+    };
+    if (msg.mediaPath) meta.media_path = msg.mediaPath;
+    if (msg.mediaType) meta.media_type = msg.mediaType;
+
+    await server.notification({
+      method: "notifications/claude/channel",
+      params: { content: msg.text || "[媒体消息]", meta },
+    });
   });
 
-  // 检查已有凭证
-  const accountIds = listIndexedWeixinAccountIds();
-  const launched = accountIds.length > 0 && launchPollLoop(accountIds[0]);
+  client.on("sessionExpired", async (accountId: string) => {
+    log(`session expired for ${accountId}`);
+    await server.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content: "微信连接已断开（session 过期），请调用 login 工具重新扫码连接。",
+        meta: { type: "session_expired" },
+      },
+    });
+  });
+
+  client.on("qrRefresh", async ({ qrcodeUrl, qrAscii }) => {
+    log(`QR code refreshed: ${qrcodeUrl}`);
+    const text = qrAscii
+      ? `二维码已过期，新二维码:\n\n${qrAscii}\n链接: ${qrcodeUrl}`
+      : `二维码已过期，请使用新链接扫码: ${qrcodeUrl}`;
+    try {
+      await server.notification({
+        method: "notifications/claude/channel",
+        params: { content: text, meta: { type: "qr_refresh" } },
+      });
+    } catch (err) {
+      log(`failed to send qr refresh notification: ${String(err)}`);
+    }
+  });
+
+  client.on("loginSuccess", (accountId) => {
+    log(`login success: ${accountId}`);
+  });
+
+  client.on("error", (err: unknown) => {
+    log(`client error: ${String(err)}`);
+  });
+
+  // 尝试启动
+  const accounts = client.listAccounts();
+  const launched = accounts.length > 0 && await client.start(accounts[0]);
   if (!launched) {
-    logger.info("no accounts found, sending login prompt notification");
+    log("no accounts found, sending login prompt notification");
     // 延迟发送，确保 MCP 连接就绪
     setTimeout(async () => {
       try {
@@ -107,13 +145,13 @@ async function main() {
           },
         });
       } catch (err) {
-        logger.warn(`failed to send login prompt: ${String(err)}`);
+        log(`failed to send login prompt: ${String(err)}`);
       }
     }, 1000);
   }
 }
 
 main().catch((err) => {
-  logger.error(`fatal: ${String(err)}`);
+  log(`fatal: ${String(err)}`);
   process.exit(1);
 });

@@ -5,81 +5,19 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
-import { getContextToken } from "./messaging/inbound.js";
-import { markdownToPlainText, sendMessageWeixin } from "./messaging/send.js";
-import { sendWeixinMediaFile } from "./messaging/send-media.js";
-import { resolveWeixinAccount, listIndexedWeixinAccountIds, removeWeixinAccount } from "./auth/accounts.js";
-import { startWeixinLoginWithQr, waitForWeixinLogin, DEFAULT_ILINK_BOT_TYPE } from "./auth/login-qr.js";
-import { saveWeixinAccount, registerWeixinAccountId, normalizeAccountId } from "./auth/accounts.js";
-import { resetSession, isSessionPaused } from "./api/session-guard.js";
-import { sendTyping } from "./api/api.js";
-import { TypingStatus } from "./api/types.js";
-import { logger } from "./util/logger.js";
+import type { WeixinBotClient } from "weixin-bot-plugin";
 
-// typing 状态管理
-type TypingState = {
-  timer: NodeJS.Timeout;
-  baseUrl: string;
-  token?: string;
-  typingTicket: string;
-};
-const typingStates = new Map<string, TypingState>();
-
-export function startTyping(chatId: string, baseUrl: string, token?: string, typingTicket?: string): void {
-  stopTyping(chatId);
-  if (!typingTicket) return;
-
-  const doTyping = () => {
-    sendTyping({
-      baseUrl, token,
-      body: { ilink_user_id: chatId, typing_ticket: typingTicket, status: TypingStatus.TYPING },
-    }).catch((err) => logger.warn(`typing send error: ${String(err)}`));
-  };
-
-  doTyping();
-  const timer = setInterval(doTyping, 5000);
-  typingStates.set(chatId, { timer, baseUrl, token, typingTicket });
+function log(msg: string): void {
+  process.stderr.write(`[weixin-claw] ${msg}\n`);
 }
 
-export function stopTyping(chatId: string): void {
-  const state = typingStates.get(chatId);
-  if (state) {
-    clearInterval(state.timer);
-    typingStates.delete(chatId);
-    // 向微信发送取消 typing 状态
-    sendTyping({
-      baseUrl: state.baseUrl, token: state.token,
-      body: { ilink_user_id: chatId, typing_ticket: state.typingTicket, status: TypingStatus.CANCEL },
-    }).catch((err) => logger.warn(`typing cancel error: ${String(err)}`));
-  }
-}
+// 权限回复正则（Claude Code 特有）
+const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)(?:\s+([a-km-z]{5}))?\s*$/i;
 
-// 上次入站消息时间
-let lastInboundAt: number | undefined;
-export function setLastInboundAt(ts: number): void { lastInboundAt = ts; }
-
-// 状态
-let pollLoopRunning = false;
-export function setPollLoopRunning(running: boolean): void { pollLoopRunning = running; }
-
-// 登录后的回调
-let onLoginSuccess: ((accountId: string) => void) | undefined;
-export function setOnLoginSuccess(cb: (accountId: string) => void): void { onLoginSuccess = cb; }
-
-// poll-loop abort 控制（供 logout 停止 poll-loop）
-let pollAbortController: AbortController | undefined;
-export function setPollAbortController(ac: AbortController): void { pollAbortController = ac; }
-
-// 最近一次待处理的权限请求 ID（供 poll-loop 在用户仅回复 yes/no 时自动填充）
-// 当 Claude 通过 reply 工具发送消息时自动清理——说明 Agent 已继续工作，权限请求已结束
+// 权限请求 ID 缓存
 let pendingPermissionRequestId: string | undefined;
-export function getPendingPermissionRequestId(): string | undefined { return pendingPermissionRequestId; }
-export function clearPendingPermissionRequestId(): void { pendingPermissionRequestId = undefined; }
 
-// 模块级 server 引用，供 handleLogin 发 notification
-let mcpServer: Server | undefined;
-
-export function createMcpServer(): Server {
+export function createMcpServer(client: WeixinBotClient): Server {
   const server = new Server(
     { name: "wechat", version: "0.1.0" },
     {
@@ -133,16 +71,16 @@ export function createMcpServer(): Server {
     const args = req.params.arguments as Record<string, string> | undefined;
 
     if (name === "reply") {
-      return handleReply(args ?? {});
+      return handleReply(client, args ?? {});
     }
     if (name === "login") {
-      return handleLogin();
+      return handleLogin(client);
     }
     if (name === "status") {
-      return handleStatus();
+      return handleStatus(client);
     }
     if (name === "logout") {
-      return handleLogout();
+      return handleLogout(client);
     }
     throw new Error(`unknown tool: ${name}`);
   });
@@ -159,16 +97,8 @@ export function createMcpServer(): Server {
   });
 
   server.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
-    const accountIds = listIndexedWeixinAccountIds();
-    if (accountIds.length === 0) return;
-    const account = resolveWeixinAccount(accountIds[0]);
-    if (!account.userId) return;
-
-    const contextToken = getContextToken(account.userId);
-    if (!contextToken) {
-      logger.warn("permission_request: no contextToken, cannot forward to WeChat");
-      return;
-    }
+    const status = client.getStatus();
+    if (!status.userId) return;
 
     const text =
       `Claude 请求执行 ${params.tool_name}:\n${params.description}\n` +
@@ -176,23 +106,18 @@ export function createMcpServer(): Server {
       `\n回复 yes / no `;
 
     try {
-      await sendMessageWeixin({
-        to: account.userId,
-        text,
-        opts: { baseUrl: account.baseUrl, token: account.token, contextToken },
-      });
+      await client.sendText(status.userId, text, { raw: true });
       // 仅在转发成功后缓存 request_id，避免用户未收到提示时 yes/no 被误拦截
       pendingPermissionRequestId = params.request_id;
     } catch (err) {
-      logger.error(`permission_request forward failed: ${String(err)}`);
+      log(`permission_request forward failed: ${String(err)}`);
     }
   });
 
-  mcpServer = server;
   return server;
 }
 
-async function handleReply(args: Record<string, string>) {
+async function handleReply(client: WeixinBotClient, args: Record<string, string>) {
   const chatId = args.chat_id;
   const text = args.text;
   const mediaPath = args.media_path;
@@ -201,102 +126,33 @@ async function handleReply(args: Record<string, string>) {
     return { content: [{ type: "text" as const, text: "缺少 chat_id 或 text 参数" }] };
   }
 
-  const contextToken = getContextToken(chatId);
-  if (!contextToken) {
-    return { content: [{ type: "text" as const, text: "未收到过该用户的消息，无法回复（缺少 context_token）" }] };
-  }
-
   // 取消 typing + 清理 pending 权限请求（Agent 已继续工作）
-  stopTyping(chatId);
+  client.stopTyping(chatId);
   clearPendingPermissionRequestId();
-
-  // 查找 account
-  const accountIds = listIndexedWeixinAccountIds();
-  if (accountIds.length === 0) {
-    return { content: [{ type: "text" as const, text: "未登录微信账号" }] };
-  }
-  const account = resolveWeixinAccount(accountIds[0]);
-
-  const plainText = markdownToPlainText(text);
 
   try {
     if (mediaPath) {
-      await sendWeixinMediaFile({
-        filePath: mediaPath,
-        to: chatId,
-        text: plainText,
-        opts: { baseUrl: account.baseUrl, token: account.token, contextToken },
-        cdnBaseUrl: account.cdnBaseUrl,
-      });
+      await client.sendMedia(chatId, mediaPath, text);
     } else {
-      await sendMessageWeixin({
-        to: chatId,
-        text: plainText,
-        opts: { baseUrl: account.baseUrl, token: account.token, contextToken },
-      });
+      await client.sendText(chatId, text);
     }
     return { content: [{ type: "text" as const, text: "已发送" }] };
   } catch (err) {
-    logger.error(`reply failed: ${String(err)}`);
+    log(`reply failed: ${String(err)}`);
     return { content: [{ type: "text" as const, text: `发送失败: ${String(err)}` }] };
   }
 }
 
-async function handleLogin() {
-  const accountIds = listIndexedWeixinAccountIds();
-  const existingId = accountIds[0];
-  const account = existingId ? resolveWeixinAccount(existingId) : null;
-  const apiBaseUrl = account?.baseUrl || "https://ilinkai.weixin.qq.com";
+async function handleLogin(client: WeixinBotClient) {
+  const result = await client.login();
 
-  const startResult = await startWeixinLoginWithQr({
-    apiBaseUrl,
-    botType: DEFAULT_ILINK_BOT_TYPE,
-  });
-
-  if (!startResult.qrcodeUrl) {
-    return { content: [{ type: "text" as const, text: `登录失败: ${startResult.message}` }] };
+  if (!result.qrcodeUrl) {
+    return { content: [{ type: "text" as const, text: `登录失败: ${result.message}` }] };
   }
 
-  // 生成 ASCII 二维码放在 tool response 中（用户可 ctrl+o 展开）
-  let qrAscii = "";
-  try {
-    const qrcodeterminal = await import("qrcode-terminal");
-    qrAscii = await new Promise<string>((resolve) => {
-      qrcodeterminal.default.generate(startResult.qrcodeUrl!, { small: true }, (qr: string) => {
-        resolve(qr);
-      });
-    });
-  } catch {
-    // qrcode-terminal 不可用
-  }
-
-  // 后台轮询扫码状态
-  (async () => {
-    const waitResult = await waitForWeixinLogin({
-      sessionKey: startResult.sessionKey,
-      apiBaseUrl,
-      timeoutMs: 480_000,
-    });
-
-    if (waitResult.connected && waitResult.botToken && waitResult.accountId) {
-      const normalizedId = normalizeAccountId(waitResult.accountId);
-      saveWeixinAccount(normalizedId, {
-        token: waitResult.botToken,
-        baseUrl: waitResult.baseUrl,
-        userId: waitResult.userId,
-      });
-      registerWeixinAccountId(normalizedId);
-      resetSession(normalizedId);
-      logger.info(`login success: accountId=${normalizedId}`);
-      onLoginSuccess?.(normalizedId);
-    } else {
-      logger.warn(`login failed: ${waitResult.message}`);
-    }
-  })().catch((err) => logger.error(`background login poll failed: ${String(err)}`));
-
-  const responseText = qrAscii
-    ? `请用微信扫描以下二维码登录（如被折叠请按 ctrl+o 展开）:\n\n${qrAscii}\n链接: ${startResult.qrcodeUrl}\n\n${startResult.message}`
-    : `${startResult.message}\n\n链接: ${startResult.qrcodeUrl}`;
+  const responseText = result.qrAscii
+    ? `请用微信扫描以下二维码登录（如被折叠请按 ctrl+o 展开）:\n\n${result.qrAscii}\n链接: ${result.qrcodeUrl}\n\n${result.message}`
+    : `${result.message}\n\n链接: ${result.qrcodeUrl}`;
 
   return {
     content: [{
@@ -306,52 +162,33 @@ async function handleLogin() {
   };
 }
 
-async function handleStatus() {
-  const accountIds = listIndexedWeixinAccountIds();
-  if (accountIds.length === 0) {
-    return { content: [{ type: "text" as const, text: JSON.stringify({ connected: false }) }] };
-  }
-  const account = resolveWeixinAccount(accountIds[0]);
-  const paused = isSessionPaused(account.accountId);
+async function handleStatus(client: WeixinBotClient) {
+  const status = client.getStatus();
   return {
     content: [{
       type: "text" as const,
       text: JSON.stringify({
-        connected: account.configured && !paused && pollLoopRunning,
-        accountId: account.accountId,
-        userId: account.userId,
-        lastInboundAt,
-        sessionPaused: paused,
+        connected: status.connected,
+        accountId: status.accountId,
+        userId: status.userId,
+        lastInboundAt: status.lastInboundAt,
+        sessionPaused: status.sessionPaused,
       }),
     }],
   };
 }
 
-async function handleLogout() {
-  const accountIds = listIndexedWeixinAccountIds();
-  if (accountIds.length === 0) {
+async function handleLogout(client: WeixinBotClient) {
+  const status = client.getStatus();
+  const accountId = status.accountId;
+
+  if (!accountId) {
     return { content: [{ type: "text" as const, text: "当前没有已登录的微信账号" }] };
   }
 
-  const accountId = accountIds[0];
-  const account = resolveWeixinAccount(accountId);
+  await client.logout();
 
-  // 停止 poll-loop
-  if (pollAbortController) {
-    pollAbortController.abort();
-    pollAbortController = undefined;
-  }
-
-  // 用 userId (chatId) 停止 typing，不是 accountId
-  if (account.userId) {
-    stopTyping(account.userId);
-  }
-  setPollLoopRunning(false);
-
-  // 清除凭证和索引
-  removeWeixinAccount(accountId);
-
-  logger.info(`logout: account ${accountId} cleared`);
+  log(`logout: account ${accountId} cleared`);
 
   return {
     content: [{
@@ -360,3 +197,7 @@ async function handleLogout() {
     }],
   };
 }
+
+export function getPendingPermissionRequestId(): string | undefined { return pendingPermissionRequestId; }
+export function clearPendingPermissionRequestId(): void { pendingPermissionRequestId = undefined; }
+export { PERMISSION_REPLY_RE };
